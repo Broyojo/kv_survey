@@ -57,6 +57,60 @@ def _first_int(c: dict, *keys: str) -> int | None:
     return None
 
 
+# Non-attention layer types in hybrid models (SSM, linear attention, etc.)
+_NON_ATTN_LAYER_TYPES = {
+    "linear_attention",  # Qwen3.5
+    "mamba", "m", "m2",  # Mamba/Mamba2
+    "deltanet",  # DeltaNet linear attention
+    "f",  # feed-forward only (nemotron_flash)
+}
+
+
+def _count_attn_layers(c: dict, L: int) -> int:
+    """Count layers with standard KV-cache attention in hybrid models.
+
+    Returns *L* (all layers) for pure attention models.
+    """
+    # layer_types: Qwen3.5 ("linear_attention"), GraniteMoEHybrid ("mamba"/"attention"),
+    #              nemotron_flash ("deltanet"/"f"/"m2"/"a")
+    lt = c.get("layer_types")
+    if isinstance(lt, list) and len(lt) == L:
+        n = sum(1 for x in lt if x not in _NON_ATTN_LAYER_TYPES)
+        if n < L:
+            return n
+
+    # layers_block_type: Zamba/Zamba2 ("hybrid"=attention, "mamba"=no attention)
+    lbt = c.get("layers_block_type")
+    if isinstance(lbt, list) and len(lbt) == L:
+        n = sum(1 for x in lbt if x != "mamba")
+        if n < L:
+            return n
+
+    # layer_type: hymba ("h"=hybrid, all have attention), nemotron_flash ("m"/"a")
+    ltype = c.get("layer_type")
+    if isinstance(ltype, list) and len(ltype) == L:
+        n = sum(1 for x in ltype if x in ("a", "h", "hybrid"))
+        if n < L:
+            return n
+
+    # attn_layer_indices: Bamba (explicit list of attention layer indices)
+    ali = c.get("attn_layer_indices")
+    if isinstance(ali, list) and len(ali) > 0:
+        return len(ali)
+
+    # attn_layer_period: Jamba (every Nth layer is attention)
+    period = c.get("attn_layer_period")
+    if isinstance(period, (int, float)) and period > 1:
+        return L // int(period)
+
+    # mamba_step: plamo2 (every Nth layer is mamba → rest are attention)
+    mstep = c.get("mamba_step")
+    if isinstance(mstep, (int, float)) and mstep > 1:
+        return L - L // int(mstep)
+
+    return L
+
+
 def compute_kv_bytes_per_token(raw: dict) -> tuple[str, int, int] | None:
     """
     Returns (attention_type, bytes_per_token, num_layers) or None.
@@ -103,19 +157,6 @@ def compute_kv_bytes_per_token(raw: dict) -> tuple[str, int, int] | None:
     if d_h is None or d_h <= 0:
         return None
 
-    # ── hybrid linear + full attention (Qwen3.5 style) ──
-    lt = c.get("layer_types")
-    if isinstance(lt, list) and "linear_attention" in lt:
-        full = sum(1 for x in lt if x != "linear_attention")
-        if full == 0:
-            return None
-        n_kv = c.get("num_key_value_heads")
-        if not isinstance(n_kv, int) or n_kv <= 0:
-            n_kv = n_q
-        bpt = 2 * n_kv * d_h * full * BYTES_PER_ELEM
-        sub = "GQA" if n_kv < n_q else "MHA"
-        return (f"Hybrid ({sub}+Linear)", bpt, L)
-
     # ── num_kv_heads ──
     n_kv = c.get("num_key_value_heads")
     if n_kv is None:
@@ -136,6 +177,9 @@ def compute_kv_bytes_per_token(raw: dict) -> tuple[str, int, int] | None:
         n_kv = n_q  # default: MHA
     n_kv = int(n_kv)
 
+    # ── hybrid: count only attention layers ──
+    attn_L = _count_attn_layers(c, L)
+
     # ── classify ──
     if n_kv == n_q:
         attn = "MHA"
@@ -144,7 +188,12 @@ def compute_kv_bytes_per_token(raw: dict) -> tuple[str, int, int] | None:
     else:
         attn = "GQA"
 
-    bpt = 2 * n_kv * d_h * L * BYTES_PER_ELEM
+    if attn_L == 0:
+        return None
+    if attn_L < L:
+        attn = f"Hybrid ({attn}+SSM)"
+
+    bpt = 2 * n_kv * d_h * attn_L * BYTES_PER_ELEM
     return (attn, bpt, L)
 
 
@@ -282,6 +331,9 @@ TYPE_COLORS = {
     "GQA (per-layer)": "#9467bd",
     "Hybrid (GQA+Linear)": "#e377c2",
     "Hybrid (MHA+Linear)": "#bcbd22",
+    "Hybrid (GQA+SSM)": "#17becf",
+    "Hybrid (MHA+SSM)": "#8c564b",
+    "Hybrid (MQA+SSM)": "#7f7f7f",
 }
 
 TYPE_ORDER = [
@@ -292,6 +344,9 @@ TYPE_ORDER = [
     "GQA (per-layer)",
     "Hybrid (GQA+Linear)",
     "Hybrid (MHA+Linear)",
+    "Hybrid (GQA+SSM)",
+    "Hybrid (MHA+SSM)",
+    "Hybrid (MQA+SSM)",
 ]
 
 
