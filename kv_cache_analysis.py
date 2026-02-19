@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-KV Cache Analysis: bytes per token across HF model configs over time.
+KV Cache Analysis: elements per token across HF model configs over time.
 
 Handles MHA, GQA, MQA, MLA (DeepSeek-style), and hybrid linear attention.
 Deduplicates fine-tunes to show unique architectures only.
@@ -30,10 +30,7 @@ import numpy as np
 ROOT = Path(__file__).parent
 CONFIGS_FILE = ROOT / "configs.jsonl"
 MODEL_LIST_FILE = ROOT / "model_list.jsonl"
-OUTPUT_PLOT = ROOT / "kv_bytes_per_token.png"
-
-# Use fp16 for all models so the comparison reflects architecture, not dtype
-BYTES_PER_ELEM = 2
+OUTPUT_PLOT = ROOT / "kv_elements_per_token.png"
 
 
 # ── KV cache computation ─────────────────────────────────────────
@@ -52,7 +49,7 @@ def _resolve(raw: dict) -> dict:
 def _first_int(c: dict, *keys: str) -> int | None:
     for k in keys:
         v = c.get(k)
-        if isinstance(v, (int, float)) and v > 0:
+        if isinstance(v, (int, float)) and 0 < v < float("inf"):
             return int(v)
     return None
 
@@ -111,16 +108,27 @@ def _count_attn_layers(c: dict, L: int) -> int:
     return L
 
 
-def compute_kv_bytes_per_token(raw: dict) -> tuple[str, int, int] | None:
-    """
-    Returns (attention_type, bytes_per_token, num_layers) or None.
+def _context_length(c: dict) -> int | None:
+    """Extract max context / sequence length from a resolved config."""
+    return _first_int(c, "max_position_embeddings", "n_positions", "n_ctx",
+                      "max_sequence_length", "seq_length", "max_seq_len",
+                      "context_length", "max_length")
 
-    Formulas (all assume fp16, per token, summed over all layers):
-      MHA:  2 * n_heads * d_head * L * 2
-      GQA:  2 * n_kv_heads * d_head * L * 2
-      MQA:  2 * 1 * d_head * L * 2
-      MLA:  (kv_lora_rank + qk_rope_head_dim) * L * 2   (joint KV, no factor of 2)
-      Hybrid: only full-attention layers counted (linear layers use fixed-size state)
+
+def compute_kv_elements_per_token(raw: dict) -> tuple[str, int, int, int | None] | None:
+    """
+    Returns (attention_type, elements_per_token, num_layers, context_length) or None.
+
+    Elements = number of scalar values stored in KV cache per token, summed
+    over all layers.  Multiply by bytes-per-element (2 for fp16, 1 for fp8,
+    etc.) to get memory.
+
+    Formulas (per token, summed over all layers):
+      MHA:  2 * n_heads * d_head * L          (2 for K + V)
+      GQA:  2 * n_kv_heads * d_head * L
+      MQA:  2 * 1 * d_head * L
+      MLA:  (kv_lora_rank + qk_rope_head_dim) * L   (joint KV, no factor of 2)
+      Hybrid: only full-attention layers counted (SSM/linear layers use fixed-size state)
     """
     c = _resolve(raw)
 
@@ -130,14 +138,16 @@ def compute_kv_bytes_per_token(raw: dict) -> tuple[str, int, int] | None:
     if L is None:
         return None
 
+    ctx = _context_length(c)
+
     # ── MLA check (DeepSeek-V2/V3, GLM-MoE-DSA, etc.) ──
     kv_lr = c.get("kv_lora_rank")
     if isinstance(kv_lr, (int, float)) and kv_lr > 0:
         qk_rope = c.get("qk_rope_head_dim", 0)
         if not isinstance(qk_rope, (int, float)):
             qk_rope = 0
-        bpt = int(kv_lr + qk_rope) * L * BYTES_PER_ELEM
-        return ("MLA", bpt, L)
+        bpt = int(kv_lr + qk_rope) * L
+        return ("MLA", bpt, L, ctx)
 
     # ── num_attention_heads ──
     n_q = _first_int(c, "num_attention_heads", "n_head", "n_heads", "num_heads",
@@ -169,8 +179,8 @@ def compute_kv_bytes_per_token(raw: dict) -> tuple[str, int, int] | None:
     # per-layer varying kv heads (e.g. OpenELM)
     if isinstance(n_kv, list):
         if all(isinstance(x, (int, float)) for x in n_kv):
-            bpt = 2 * sum(int(h) * d_h for h in n_kv) * BYTES_PER_ELEM
-            return ("GQA (per-layer)", bpt, L)
+            bpt = 2 * sum(int(h) * d_h for h in n_kv)
+            return ("GQA (per-layer)", bpt, L, ctx)
         return None
 
     if not isinstance(n_kv, (int, float)) or n_kv <= 0:
@@ -193,8 +203,8 @@ def compute_kv_bytes_per_token(raw: dict) -> tuple[str, int, int] | None:
     if attn_L < L:
         attn = f"Hybrid ({attn}+SSM)"
 
-    bpt = 2 * n_kv * d_h * attn_L * BYTES_PER_ELEM
-    return (attn, bpt, L)
+    bpt = 2 * n_kv * d_h * attn_L
+    return (attn, bpt, L, ctx)
 
 
 # ── Data loading ──────────────────────────────────────────────────
@@ -204,8 +214,9 @@ def compute_kv_bytes_per_token(raw: dict) -> tuple[str, int, int] | None:
 class Result:
     repo_id: str
     attn_type: str
-    bytes_per_token: int
+    elements_per_token: int
     num_layers: int
+    context_length: int | None = None
     created_at: datetime | None = None
     downloads: int = 0
 
@@ -242,7 +253,7 @@ def process_all() -> list[Result]:
     meta = load_model_meta()
     print(f"  {len(meta):,} models with metadata")
 
-    print("Computing KV cache bytes/token for all configs...")
+    print("Computing KV cache elements/token for all configs...")
     results: list[Result] = []
     skipped = 0
 
@@ -256,15 +267,15 @@ def process_all() -> list[Result]:
                 continue
 
             repo_id = raw.get("_repo_id", "")
-            out = compute_kv_bytes_per_token(raw)
+            out = compute_kv_elements_per_token(raw)
             if out is None:
                 skipped += 1
                 continue
 
-            attn, bpt, nl = out
+            attn, bpt, nl, ctx = out
 
             # sanity: skip clearly broken configs
-            if bpt <= 0 or bpt > 500_000_000:
+            if bpt <= 0 or bpt > 250_000_000:
                 skipped += 1
                 continue
 
@@ -273,8 +284,9 @@ def process_all() -> list[Result]:
                 Result(
                     repo_id=repo_id,
                     attn_type=attn,
-                    bytes_per_token=bpt,
+                    elements_per_token=bpt,
                     num_layers=nl,
+                    context_length=ctx,
                     created_at=m.created_at if m else None,
                     downloads=m.downloads if m else 0,
                 )
@@ -289,7 +301,7 @@ def process_all() -> list[Result]:
 
 def deduplicate(results: list[Result]) -> list[Result]:
     """
-    Keep one entry per unique (attn_type, num_layers, bytes_per_token).
+    Keep one entry per unique (attn_type, num_layers, elements_per_token).
     Uses earliest date; sums downloads across all models sharing the fingerprint.
     """
     dated = [r for r in results if r.created_at is not None]
@@ -300,7 +312,7 @@ def deduplicate(results: list[Result]) -> list[Result]:
     agg_downloads: dict[tuple, int] = Counter()
 
     for r in dated:
-        key = (r.attn_type, r.num_layers, r.bytes_per_token)
+        key = (r.attn_type, r.num_layers, r.elements_per_token)
         agg_downloads[key] += r.downloads
 
         if key not in earliest_date or r.created_at < earliest_date[key]:
@@ -350,35 +362,56 @@ TYPE_ORDER = [
 ]
 
 
-def _bytes_fmt(val: float, _pos: object = None) -> str:
-    if val >= 1_048_576:
-        return f"{val / 1_048_576:.1f} MiB"
-    if val >= 1024:
-        return f"{val / 1024:.0f} KiB"
-    return f"{val:.0f} B"
+def _elems_fmt(val: float, _pos: object = None) -> str:
+    if val >= 1_000_000:
+        return f"{val / 1_000_000:.1f}M"
+    if val >= 1_000:
+        return f"{val / 1_000:.0f}K"
+    return f"{val:.0f}"
+
+
+@dataclass
+class TrendResult:
+    dates: np.ndarray      # datetime x values for the line
+    y_fit: np.ndarray      # fitted trend line
+    y_ci_lo: np.ndarray    # lower 95% CI bound
+    y_ci_hi: np.ndarray    # upper 95% CI bound
 
 
 def _log_linreg(
     dates: list[datetime],
     values: list[float],
     weights: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray] | None:
+) -> TrendResult | None:
     """
     Linear regression on (timestamp, log(value)).
     Optional *weights* for weighted least squares.
-    Returns (x_line, y_line) for plotting.
+    Returns TrendResult with fitted line and 95% confidence interval.
     """
     if len(dates) < 10:
         return None
     epoch = datetime(2020, 1, 1)
     x = np.array([(d.replace(tzinfo=None) - epoch).total_seconds() / 86400 for d in dates])
     y = np.log(np.array(values, dtype=float))
+    n = len(x)
 
-    coeffs = np.polyfit(x, y, 1, w=weights)
+    coeffs, cov = np.polyfit(x, y, 1, w=weights, cov=True)
     x_line = np.linspace(x.min(), x.max(), 200)
-    y_line = np.exp(np.polyval(coeffs, x_line))
+    y_hat = np.polyval(coeffs, x_line)
+
+    # variance of prediction at each x: Var(a*x+b) = x²Var(a) + 2x·Cov(a,b) + Var(b)
+    var_pred = cov[0, 0] * x_line**2 + 2 * cov[0, 1] * x_line + cov[1, 1]
+    se_pred = np.sqrt(np.maximum(var_pred, 0))
+
+    # 95% CI (use z=1.96 since n is large)
+    z = 1.96
     d_line = np.array([epoch + timedelta(days=float(d)) for d in x_line])
-    return d_line, y_line
+    return TrendResult(
+        dates=d_line,
+        y_fit=np.exp(y_hat),
+        y_ci_lo=np.exp(y_hat - z * se_pred),
+        y_ci_hi=np.exp(y_hat + z * se_pred),
+    )
 
 
 def plot(
@@ -388,6 +421,7 @@ def plot(
     out_path: Path,
     per_type_trends: list[str] | None = None,
     weighted: bool = False,
+    per_year: bool = False,
 ) -> None:
     """
     Args:
@@ -395,6 +429,8 @@ def plot(
             lines for (e.g. ["MHA", "GQA"]).  ``None`` means no per-type lines.
         weighted: if True, weight regression by log(1+downloads) and scale
             scatter point sizes by popularity.
+        per_year: if True, draw separate regression lines per calendar year
+            instead of one overall line.
     """
     fig, ax = plt.subplots(figsize=(16, 9))
 
@@ -417,7 +453,7 @@ def plot(
         if not pts:
             continue
         xs = [r.created_at for r in pts]
-        ys = [r.bytes_per_token for r in pts]
+        ys = [r.elements_per_token for r in pts]
         ax.scatter(
             xs,
             ys,
@@ -431,37 +467,76 @@ def plot(
 
     # ── regression trend lines (exponential fit: y = a·e^(bx)) ──
     all_dates = [r.created_at for r in unique]
-    all_bpt = [float(r.bytes_per_token) for r in unique]
+    all_bpt = [float(r.elements_per_token) for r in unique]
 
     trend_suffix = " (weighted)" if weighted else ""
 
-    # overall
-    overall = _log_linreg(all_dates, all_bpt, _weights(unique))
-    if overall is not None:
-        ax.plot(
-            overall[0], overall[1],
-            color="black", lw=2.5, alpha=0.7, zorder=4,
-            label=f"Overall trend{trend_suffix}",
-        )
+    if per_year:
+        # separate regression per calendar year
+        import colorsys
+        years = sorted({r.created_at.replace(tzinfo=None).year for r in unique})
+        n_years = len(years)
+        for i, yr in enumerate(years):
+            yr_pts = [r for r in unique
+                      if r.created_at.replace(tzinfo=None).year == yr]
+            if len(yr_pts) < 10:
+                print(f"  Skipping {yr} trend (only {len(yr_pts)} points)")
+                continue
+            tr = _log_linreg(
+                [r.created_at for r in yr_pts],
+                [float(r.elements_per_token) for r in yr_pts],
+                _weights(yr_pts),
+            )
+            if tr is None:
+                continue
+            hue = i / max(n_years, 1)
+            clr = colorsys.hls_to_rgb(hue, 0.4, 0.9)
+            ax.plot(
+                tr.dates, tr.y_fit,
+                color=clr, lw=2.5, alpha=0.8, zorder=4,
+                label=f"{yr} trend (n={len(yr_pts)})",
+            )
+            ax.fill_between(
+                tr.dates, tr.y_ci_lo, tr.y_ci_hi,
+                color=clr, alpha=0.12, zorder=3,
+            )
+    else:
+        # overall
+        overall = _log_linreg(all_dates, all_bpt, _weights(unique))
+        if overall is not None:
+            ax.plot(
+                overall.dates, overall.y_fit,
+                color="black", lw=2.5, alpha=0.7, zorder=4,
+                label=f"Overall trend{trend_suffix}",
+            )
+            ax.fill_between(
+                overall.dates, overall.y_ci_lo, overall.y_ci_hi,
+                color="black", alpha=0.10, zorder=3,
+                label="95% CI",
+            )
 
-    # per-type (only when requested)
-    if per_type_trends:
+    # per-type (only when requested, not combined with per-year)
+    if per_type_trends and not per_year:
         for attn_type in per_type_trends:
             pts = [r for r in unique if r.attn_type == attn_type]
             if len(pts) < 10:
                 print(f"  Skipping {attn_type} trend (only {len(pts)} points)")
                 continue
-            result = _log_linreg(
+            tr = _log_linreg(
                 [r.created_at for r in pts],
-                [float(r.bytes_per_token) for r in pts],
+                [float(r.elements_per_token) for r in pts],
                 _weights(pts),
             )
-            if result is not None:
+            if tr is not None:
+                clr = TYPE_COLORS.get(attn_type, "#7f7f7f")
                 ax.plot(
-                    result[0], result[1],
-                    color=TYPE_COLORS.get(attn_type, "#7f7f7f"),
-                    lw=2, alpha=0.8, ls="--", zorder=4,
+                    tr.dates, tr.y_fit,
+                    color=clr, lw=2, alpha=0.8, ls="--", zorder=4,
                     label=f"{attn_type} trend{trend_suffix}",
+                )
+                ax.fill_between(
+                    tr.dates, tr.y_ci_lo, tr.y_ci_hi,
+                    color=clr, alpha=0.08, zorder=3,
                 )
 
     # ── axes ──
@@ -475,12 +550,12 @@ def plot(
         p99 = float(np.percentile(all_bpt, 99))
         ax.set_ylim(0, p99 * 1.1)
 
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(_bytes_fmt))
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(_elems_fmt))
     ax.set_xlabel("Model Release Date", fontsize=12)
-    ax.set_ylabel(f"KV Cache Bytes / Token (all layers, fp16, {scale_label})", fontsize=12)
+    ax.set_ylabel(f"KV Cache Elements / Token (all layers, {scale_label})", fontsize=12)
     ax.set_title(
-        "KV Cache Memory per Token Over Time\n"
-        "Unique architectures, deduplicated across fine-tunes, assuming fp16"
+        "KV Cache Elements per Token Over Time\n"
+        "Unique architectures, deduplicated across fine-tunes"
         f" — {scale_label} scale",
         fontsize=13,
     )
@@ -498,6 +573,67 @@ def plot(
     plt.close()
 
 
+def plot_vs_context(
+    unique: list[Result],
+    *,
+    out_path: Path,
+    weighted: bool = False,
+) -> None:
+    """Scatter plot of KV elements/token vs context length, colored by attention type."""
+    # filter to models that have context length
+    pts = [r for r in unique if r.context_length is not None and r.context_length > 0]
+    if not pts:
+        print("  No models with context length — skipping vs-context plot")
+        return
+
+    fig, ax = plt.subplots(figsize=(16, 9))
+
+    def _sizes(subset: list[Result]) -> np.ndarray | float:
+        if not weighted:
+            return 14
+        s = np.log1p(np.array([r.downloads for r in subset], dtype=float))
+        s = 6 + (s / max(s.max(), 1)) * 114
+        return s
+
+    for attn_type in TYPE_ORDER:
+        sub = [r for r in pts if r.attn_type == attn_type]
+        if not sub:
+            continue
+        ax.scatter(
+            [r.context_length for r in sub],
+            [r.elements_per_token for r in sub],
+            c=TYPE_COLORS.get(attn_type, "#7f7f7f"),
+            label=f"{attn_type} ({len(sub):,})",
+            alpha=0.35,
+            s=_sizes(sub),
+            edgecolors="none",
+            zorder=2,
+        )
+
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.xaxis.set_major_formatter(mticker.FuncFormatter(
+        lambda v, _: f"{v/1_000_000:.0f}M" if v >= 1_000_000
+        else f"{v/1_000:.0f}K" if v >= 1_000 else f"{v:.0f}",
+    ))
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(_elems_fmt))
+    ax.set_xlabel("Context Length (tokens)", fontsize=12)
+    ax.set_ylabel("KV Cache Elements / Token (all layers)", fontsize=12)
+    ax.set_title(
+        "KV Cache Elements per Token vs Context Length\n"
+        "Unique architectures, deduplicated across fine-tunes",
+        fontsize=13,
+    )
+
+    ax.legend(loc="upper left", fontsize=9, framealpha=0.9, ncol=2)
+    ax.grid(True, alpha=0.25, which="both")
+
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    print(f"  Saved {out_path}")
+    plt.close()
+
+
 # ── CLI ───────────────────────────────────────────────────────────
 
 ALL_ATTN_TYPES = [t for t in TYPE_ORDER]
@@ -505,7 +641,7 @@ ALL_ATTN_TYPES = [t for t in TYPE_ORDER]
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Plot KV cache bytes/token over time for HF models.",
+        description="Plot KV cache elements/token over time for HF models.",
     )
     p.add_argument(
         "--per-type",
@@ -527,6 +663,11 @@ def parse_args() -> argparse.Namespace:
             "Downloads are summed across all fine-tunes sharing an architecture.  "
             "Also scales scatter point sizes by popularity."
         ),
+    )
+    p.add_argument(
+        "--per-year",
+        action="store_true",
+        help="Draw separate trend lines per calendar year instead of one overall line.",
     )
     return p.parse_args()
 
@@ -561,21 +702,27 @@ def main() -> None:
     for t, c in u_counts.most_common():
         print(f"  {t:30s} {c:>8,}")
 
-    bpts = np.array([r.bytes_per_token for r in unique])
-    print(f"\nKV bytes/token (unique, fp16):")
-    print(f"  min:    {_bytes_fmt(bpts.min()):>12s}")
-    print(f"  median: {_bytes_fmt(np.median(bpts)):>12s}")
-    print(f"  mean:   {_bytes_fmt(bpts.mean()):>12s}")
-    print(f"  max:    {_bytes_fmt(bpts.max()):>12s}")
+    epts = np.array([r.elements_per_token for r in unique])
+    print(f"\nKV elements/token (unique):")
+    print(f"  min:    {_elems_fmt(epts.min()):>12s}")
+    print(f"  median: {_elems_fmt(np.median(epts)):>12s}")
+    print(f"  mean:   {_elems_fmt(epts.mean()):>12s}")
+    print(f"  max:    {_elems_fmt(epts.max()):>12s}")
 
     print("\nPlotting...")
-    plot_kw = dict(per_type_trends=per_type, weighted=args.weighted)
+    plot_kw = dict(per_type_trends=per_type, weighted=args.weighted,
+                   per_year=args.per_year)
     plot(unique, log_scale=True, out_path=OUTPUT_PLOT, **plot_kw)
     plot(
         unique,
         log_scale=False,
-        out_path=OUTPUT_PLOT.with_stem("kv_bytes_per_token_linear"),
+        out_path=OUTPUT_PLOT.with_stem("kv_elements_per_token_linear"),
         **plot_kw,
+    )
+    plot_vs_context(
+        unique,
+        out_path=OUTPUT_PLOT.with_stem("kv_elements_vs_context"),
+        weighted=args.weighted,
     )
 
 
