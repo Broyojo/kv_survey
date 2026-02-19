@@ -4,12 +4,20 @@ KV Cache Analysis: bytes per token across HF model configs over time.
 
 Handles MHA, GQA, MQA, MLA (DeepSeek-style), and hybrid linear attention.
 Deduplicates fine-tunes to show unique architectures only.
+
+Usage:
+    python kv_cache_analysis.py                      # overall trend only
+    python kv_cache_analysis.py --per-type            # + per-attention-type trends
+    python kv_cache_analysis.py --per-type MHA GQA    # + only MHA and GQA trends
+    python kv_cache_analysis.py --weighted            # weight by model popularity
+    python kv_cache_analysis.py --weighted --per-type # both
 """
 
+import argparse
 import json
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import matplotlib
@@ -63,7 +71,8 @@ def compute_kv_bytes_per_token(raw: dict) -> tuple[str, int, int] | None:
     c = _resolve(raw)
 
     # ── num_layers ──
-    L = _first_int(c, "num_hidden_layers", "n_layer", "n_layers", "num_layers")
+    L = _first_int(c, "num_hidden_layers", "n_layer", "n_layers", "num_layers",
+                   "decoder_layers", "num_decoder_layers")
     if L is None:
         return None
 
@@ -77,14 +86,16 @@ def compute_kv_bytes_per_token(raw: dict) -> tuple[str, int, int] | None:
         return ("MLA", bpt, L)
 
     # ── num_attention_heads ──
-    n_q = _first_int(c, "num_attention_heads", "n_head", "n_heads", "num_heads")
+    n_q = _first_int(c, "num_attention_heads", "n_head", "n_heads", "num_heads",
+                     "decoder_attention_heads", "encoder_attention_heads",
+                     "attention_heads", "nhead", "num_decoder_attention_heads")
     if n_q is None:
         return None
 
     # ── head_dim ──
     d_h = _first_int(c, "head_dim")
     if d_h is None:
-        hs = _first_int(c, "hidden_size", "d_model", "n_embd", "dim")
+        hs = _first_int(c, "hidden_size", "d_model", "n_embd", "n_embed", "dim")
         if hs is not None:
             d_h = hs // n_q
         else:
@@ -147,10 +158,17 @@ class Result:
     bytes_per_token: int
     num_layers: int
     created_at: datetime | None = None
+    downloads: int = 0
 
 
-def load_dates() -> dict[str, datetime]:
-    dates: dict[str, datetime] = {}
+@dataclass
+class ModelMeta:
+    created_at: datetime
+    downloads: int
+
+
+def load_model_meta() -> dict[str, ModelMeta]:
+    meta: dict[str, ModelMeta] = {}
     with open(MODEL_LIST_FILE) as f:
         for line in f:
             try:
@@ -158,16 +176,22 @@ def load_dates() -> dict[str, datetime]:
                 rid = obj.get("id")
                 ts = obj.get("created_at")
                 if rid and ts:
-                    dates[rid] = datetime.fromisoformat(ts)
+                    dl = obj.get("downloads") or 0
+                    if not isinstance(dl, (int, float)):
+                        dl = 0
+                    meta[rid] = ModelMeta(
+                        created_at=datetime.fromisoformat(ts),
+                        downloads=int(dl),
+                    )
             except (json.JSONDecodeError, ValueError):
                 continue
-    return dates
+    return meta
 
 
 def process_all() -> list[Result]:
-    print("Loading model release dates...")
-    dates = load_dates()
-    print(f"  {len(dates):,} models with dates")
+    print("Loading model metadata...")
+    meta = load_model_meta()
+    print(f"  {len(meta):,} models with metadata")
 
     print("Computing KV cache bytes/token for all configs...")
     results: list[Result] = []
@@ -195,13 +219,15 @@ def process_all() -> list[Result]:
                 skipped += 1
                 continue
 
+            m = meta.get(repo_id)
             results.append(
                 Result(
                     repo_id=repo_id,
                     attn_type=attn,
                     bytes_per_token=bpt,
                     num_layers=nl,
-                    created_at=dates.get(repo_id),
+                    created_at=m.created_at if m else None,
+                    downloads=m.downloads if m else 0,
                 )
             )
 
@@ -213,15 +239,33 @@ def process_all() -> list[Result]:
 
 
 def deduplicate(results: list[Result]) -> list[Result]:
-    """Keep one entry per unique (attn_type, num_layers, bytes_per_token), earliest date."""
+    """
+    Keep one entry per unique (attn_type, num_layers, bytes_per_token).
+    Uses earliest date; sums downloads across all models sharing the fingerprint.
+    """
     dated = [r for r in results if r.created_at is not None]
     print(f"  With release dates: {len(dated):,}")
 
     best: dict[tuple, Result] = {}
+    earliest_date: dict[tuple, datetime] = {}
+    agg_downloads: dict[tuple, int] = Counter()
+
     for r in dated:
         key = (r.attn_type, r.num_layers, r.bytes_per_token)
-        if key not in best or r.created_at < best[key].created_at:
+        agg_downloads[key] += r.downloads
+
+        if key not in earliest_date or r.created_at < earliest_date[key]:
+            earliest_date[key] = r.created_at
+
+        if key not in best:
             best[key] = r
+        elif r.created_at < best[key].created_at:
+            best[key] = r
+
+    # write aggregated downloads and earliest date back
+    for key, r in best.items():
+        r.downloads = agg_downloads[key]
+        r.created_at = earliest_date[key]
 
     unique = list(best.values())
     print(f"  Unique architectures: {len(unique):,}")
@@ -229,25 +273,6 @@ def deduplicate(results: list[Result]) -> list[Result]:
 
 
 # ── Plotting ──────────────────────────────────────────────────────
-
-NOTABLE_MODELS = {
-    "openai-community/gpt2": "GPT-2",
-    "google-bert/bert-base-uncased": "BERT",
-    "bigscience/bloom": "BLOOM 176B",
-    "tiiuae/falcon-40b": "Falcon 40B",
-    "meta-llama/Llama-2-7b-hf": "Llama 2 7B",
-    "meta-llama/Llama-2-70b-hf": "Llama 2 70B",
-    "mistralai/Mistral-7B-v0.1": "Mistral 7B",
-    "microsoft/phi-2": "Phi-2",
-    "meta-llama/Meta-Llama-3-8B": "Llama 3 8B",
-    "meta-llama/Meta-Llama-3-70B": "Llama 3 70B",
-    "meta-llama/Llama-3.1-405B": "Llama 3.1 405B",
-    "google/gemma-2-27b": "Gemma 2 27B",
-    "Qwen/Qwen2-72B": "Qwen2 72B",
-    "deepseek-ai/DeepSeek-V2": "DeepSeek-V2",
-    "deepseek-ai/DeepSeek-V3": "DeepSeek-V3",
-    "Qwen/Qwen3-235B-A22B": "Qwen3 235B",
-}
 
 TYPE_COLORS = {
     "MHA": "#1f77b4",
@@ -278,9 +303,60 @@ def _bytes_fmt(val: float, _pos: object = None) -> str:
     return f"{val:.0f} B"
 
 
-def plot(unique: list[Result]) -> None:
+def _log_linreg(
+    dates: list[datetime],
+    values: list[float],
+    weights: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """
+    Linear regression on (timestamp, log(value)).
+    Optional *weights* for weighted least squares.
+    Returns (x_line, y_line) for plotting.
+    """
+    if len(dates) < 10:
+        return None
+    epoch = datetime(2020, 1, 1)
+    x = np.array([(d.replace(tzinfo=None) - epoch).total_seconds() / 86400 for d in dates])
+    y = np.log(np.array(values, dtype=float))
+
+    coeffs = np.polyfit(x, y, 1, w=weights)
+    x_line = np.linspace(x.min(), x.max(), 200)
+    y_line = np.exp(np.polyval(coeffs, x_line))
+    d_line = np.array([epoch + timedelta(days=float(d)) for d in x_line])
+    return d_line, y_line
+
+
+def plot(
+    unique: list[Result],
+    *,
+    log_scale: bool,
+    out_path: Path,
+    per_type_trends: list[str] | None = None,
+    weighted: bool = False,
+) -> None:
+    """
+    Args:
+        per_type_trends: list of attention type names to draw individual trend
+            lines for (e.g. ["MHA", "GQA"]).  ``None`` means no per-type lines.
+        weighted: if True, weight regression by log(1+downloads) and scale
+            scatter point sizes by popularity.
+    """
     fig, ax = plt.subplots(figsize=(16, 9))
 
+    def _weights(pts: list[Result]) -> np.ndarray | None:
+        if not weighted:
+            return None
+        return np.log1p(np.array([r.downloads for r in pts], dtype=float))
+
+    def _sizes(pts: list[Result]) -> np.ndarray | float:
+        if not weighted:
+            return 14
+        # scale marker area: log1p -> clamp to [6, 120]
+        s = np.log1p(np.array([r.downloads for r in pts], dtype=float))
+        s = 6 + (s / max(s.max(), 1)) * 114
+        return s
+
+    # ── scatter points ──
     for attn_type in TYPE_ORDER:
         pts = [r for r in unique if r.attn_type == attn_type]
         if not pts:
@@ -292,35 +368,65 @@ def plot(unique: list[Result]) -> None:
             ys,
             c=TYPE_COLORS.get(attn_type, "#7f7f7f"),
             label=f"{attn_type} ({len(pts):,})",
-            alpha=0.45,
-            s=18,
+            alpha=0.35,
+            s=_sizes(pts),
             edgecolors="none",
             zorder=2,
         )
 
-    # annotate notable models
-    for r in unique:
-        label = NOTABLE_MODELS.get(r.repo_id)
-        if label is None:
-            continue
-        ax.annotate(
-            label,
-            xy=(r.created_at, r.bytes_per_token),
-            xytext=(12, 6),
-            textcoords="offset points",
-            fontsize=7,
-            arrowprops=dict(arrowstyle="->", color="gray", lw=0.7),
-            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="gray", alpha=0.85),
-            zorder=5,
+    # ── regression trend lines (exponential fit: y = a·e^(bx)) ──
+    all_dates = [r.created_at for r in unique]
+    all_bpt = [float(r.bytes_per_token) for r in unique]
+
+    trend_suffix = " (weighted)" if weighted else ""
+
+    # overall
+    overall = _log_linreg(all_dates, all_bpt, _weights(unique))
+    if overall is not None:
+        ax.plot(
+            overall[0], overall[1],
+            color="black", lw=2.5, alpha=0.7, zorder=4,
+            label=f"Overall trend{trend_suffix}",
         )
 
-    ax.set_yscale("log")
+    # per-type (only when requested)
+    if per_type_trends:
+        for attn_type in per_type_trends:
+            pts = [r for r in unique if r.attn_type == attn_type]
+            if len(pts) < 10:
+                print(f"  Skipping {attn_type} trend (only {len(pts)} points)")
+                continue
+            result = _log_linreg(
+                [r.created_at for r in pts],
+                [float(r.bytes_per_token) for r in pts],
+                _weights(pts),
+            )
+            if result is not None:
+                ax.plot(
+                    result[0], result[1],
+                    color=TYPE_COLORS.get(attn_type, "#7f7f7f"),
+                    lw=2, alpha=0.8, ls="--", zorder=4,
+                    label=f"{attn_type} trend{trend_suffix}",
+                )
+
+    # ── axes ──
+    if log_scale:
+        ax.set_yscale("log")
+        scale_label = "log"
+    else:
+        ax.set_yscale("linear")
+        scale_label = "linear"
+        # cap y-axis at 99th percentile so the exponential curves are visible
+        p99 = float(np.percentile(all_bpt, 99))
+        ax.set_ylim(0, p99 * 1.1)
+
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(_bytes_fmt))
     ax.set_xlabel("Model Release Date", fontsize=12)
-    ax.set_ylabel("KV Cache Bytes / Token (all layers, fp16)", fontsize=12)
+    ax.set_ylabel(f"KV Cache Bytes / Token (all layers, fp16, {scale_label})", fontsize=12)
     ax.set_title(
         "KV Cache Memory per Token Over Time\n"
-        "Unique architectures, deduplicated across fine-tunes, assuming fp16",
+        "Unique architectures, deduplicated across fine-tunes, assuming fp16"
+        f" — {scale_label} scale",
         fontsize=13,
     )
 
@@ -328,19 +434,62 @@ def plot(unique: list[Result]) -> None:
     ax.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
     fig.autofmt_xdate(rotation=45)
 
-    ax.legend(loc="upper left", fontsize=9, framealpha=0.9)
-    ax.grid(True, alpha=0.25, which="both")
+    ax.legend(loc="upper left", fontsize=9, framealpha=0.9, ncol=2)
+    ax.grid(True, alpha=0.25, which="both" if log_scale else "major")
 
     plt.tight_layout()
-    fig.savefig(OUTPUT_PLOT, dpi=200, bbox_inches="tight")
-    print(f"\nSaved plot to {OUTPUT_PLOT}")
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    print(f"  Saved {out_path}")
     plt.close()
+
+
+# ── CLI ───────────────────────────────────────────────────────────
+
+ALL_ATTN_TYPES = [t for t in TYPE_ORDER]
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Plot KV cache bytes/token over time for HF models.",
+    )
+    p.add_argument(
+        "--per-type",
+        nargs="*",
+        metavar="TYPE",
+        default=None,
+        help=(
+            "Show per-attention-type trend lines.  "
+            "Without arguments: show all types that have enough data.  "
+            "With arguments: only the listed types.  "
+            f"Choices: {', '.join(ALL_ATTN_TYPES)}"
+        ),
+    )
+    p.add_argument(
+        "--weighted",
+        action="store_true",
+        help=(
+            "Weight regression by model popularity (log(1+downloads)).  "
+            "Downloads are summed across all fine-tunes sharing an architecture.  "
+            "Also scales scatter point sizes by popularity."
+        ),
+    )
+    return p.parse_args()
 
 
 # ── Main ──────────────────────────────────────────────────────────
 
 
 def main() -> None:
+    args = parse_args()
+
+    # resolve --per-type: None=flag absent, []=flag with no args, [..]=explicit list
+    if args.per_type is None:
+        per_type: list[str] | None = None
+    elif len(args.per_type) == 0:
+        per_type = list(ALL_ATTN_TYPES)
+    else:
+        per_type = args.per_type
+
     results = process_all()
 
     # type breakdown (all models)
@@ -364,7 +513,15 @@ def main() -> None:
     print(f"  mean:   {_bytes_fmt(bpts.mean()):>12s}")
     print(f"  max:    {_bytes_fmt(bpts.max()):>12s}")
 
-    plot(unique)
+    print("\nPlotting...")
+    plot_kw = dict(per_type_trends=per_type, weighted=args.weighted)
+    plot(unique, log_scale=True, out_path=OUTPUT_PLOT, **plot_kw)
+    plot(
+        unique,
+        log_scale=False,
+        out_path=OUTPUT_PLOT.with_stem("kv_bytes_per_token_linear"),
+        **plot_kw,
+    )
 
 
 if __name__ == "__main__":
