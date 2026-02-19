@@ -25,8 +25,8 @@ from huggingface_hub import HfApi
 from tqdm import tqdm
 
 # ── Configuration ──────────────────────────────────────────────
-CONCURRENCY = 50           # parallel downloads
-RATE_LIMIT_PER_SEC = 100   # max requests/sec
+CONCURRENCY = 30           # parallel downloads
+RATE_LIMIT_PER_SEC = 35   # max requests/sec
 MODEL_LIST_FILE = "model_list.jsonl"  # full ModelInfo
 CONFIG_FILE = "configs.jsonl"          # config.json contents
 FAILED_FILE = "failed.jsonl"
@@ -247,6 +247,10 @@ async def download_all_configs(repo_ids: list[str]):
                         repo_id, config, error = result
 
                         if config is not None:
+                            if not isinstance(config, dict):
+                                stats["error"] += 1
+                                pbar.update(1)
+                                continue
                             record = {"_repo_id": repo_id, **config}
                             await out_f.write(json.dumps(record) + "\n")
                             stats["success"] += 1
